@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# nvidia-media-setup.sh
+# nvidia-setup.sh
 # Installs/updates NVIDIA drivers and Docker with NVIDIA support, optimized for Plex and FFmpeg
 # Written for Ubuntu 22.04 (Jammy)
 
