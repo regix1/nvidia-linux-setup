@@ -8,36 +8,25 @@ set -eo pipefail
 trap 'echo -e "\n\033[1;31m[ERROR] Script failed at line $LINENO\033[0m"; exit 1' ERR
 
 # Configuration variables
-NVIDIA_DRIVER_VERSION="550" # Latest stable driver as of March 2025
-CUDA_VERSION="12.4.0"
 UBUNTU_VERSION="22.04"
 DOCKER_COMPOSE_VERSION="v2.25.0"
-ALLOW_UNSUPPORTED_OS=0
+CUDA_VERSION="12.4.0"  # Default CUDA version
 
 ###############################################
 # Enhanced Logging + Interactive Functions
 ###############################################
 log_info()  { echo -e "\033[1;32m[INFO]  $*\033[0m"; }
 log_warn()  { echo -e "\033[1;33m[WARN]  $*\033[0m"; }
-log_error() { echo -e "\033[1;31m[ERR]   $*\033[0m"; }
+log_error() { echo -e "\033[1;31m[ERROR] $*\033[0m"; }
 log_prompt() { echo -e "\033[1;36m[INPUT] $*\033[0m"; }
 log_step() { echo -e "\n\033[1;34m[STEP]  $*\033[0m"; }
 
-# Progress indicator
-show_progress() {
-    local pid=$1
-    local delay=0.1
-    local spinstr='|/-\'
-    local i=0
-    
-    while ps -p $pid &>/dev/null; do
-        local temp=${spinstr#?}
-        printf "\r\033[1;36m[%c] Working...\033[0m" "$spinstr"
-        spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        ((i=i+1))
-    done
-    printf "\r\033[K"
+# Execute command without progress spinner
+run_command() {
+    local cmd="$*"
+    log_info "Running: $cmd"
+    eval "$cmd" || { log_error "Command failed: $cmd"; return 1; }
+    return 0
 }
 
 prompt_yes_no() {
@@ -55,98 +44,43 @@ prompt_yes_no() {
     done
 }
 
-# Execute command with progress spinner
-run_with_progress() {
-    local cmd="$*"
-    log_info "Running: $cmd"
-    eval "$cmd" &>/dev/null & 
-    show_progress $!
-    wait $! || { log_error "Command failed: $cmd"; return 1; }
-    return 0
-}
-
 ###############################################
-# Repository and Package Management
+# Package and Repository Management
 ###############################################
-cleanup_nvidia_repos() {
-    log_step "Cleaning up NVIDIA repository files..."
-    
-    # Use arrays for cleaner management
-    local repo_files=(
-        "/etc/apt/sources.list.d/nvidia-docker.list"
-        "/etc/apt/sources.list.d/nvidia-container-toolkit.list" 
-        "/etc/apt/sources.list.d/nvidia*.list"
-    )
-    
-    local keyring_files=(
-        "/etc/apt/keyrings/nvidia-docker.gpg"
-        "/etc/apt/keyrings/nvidia-*.gpg"
-        "/usr/share/keyrings/nvidia-docker.gpg"
-        "/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
-    )
-    
-    # Remove repo files
-    for file in "${repo_files[@]}"; do
-        rm -f $file
-    done
-    
-    # Remove keyring files
-    for file in "${keyring_files[@]}"; do
-        rm -f $file
-    done
-
-    # Clean up driver if version mismatch detected
-    if command -v nvidia-smi &>/dev/null && nvidia-smi 2>&1 | grep -q "Driver/library version mismatch"; then
-        log_warn "Detected NVIDIA driver version mismatch. Cleaning up..."
-        run_with_progress "apt-get remove --purge -y '^nvidia-.*'"
-        run_with_progress "apt-get autoremove --purge -y"
-        run_with_progress "update-initramfs -u"
-    fi
-}
-
-# Optimized apt operations with caching
 apt_update_cache=0
 apt_update() {
     if [[ $apt_update_cache -eq 0 ]]; then
-        run_with_progress "apt-get update"
+        run_command "apt-get update"
         apt_update_cache=1
     fi
 }
 
 apt_install() {
     apt_update
-    run_with_progress "DEBIAN_FRONTEND=noninteractive apt-get install -y $*"
+    run_command "DEBIAN_FRONTEND=noninteractive apt-get install -y $*"
 }
 
-###############################################
-# Docker Status Check Functions
-###############################################
-check_docker_installation() {
-    if command -v docker >/dev/null 2>&1; then
-        log_info "Docker is already installed."
-        docker_version=$(docker --version)
-        log_info "Current version: $docker_version"
-        return 0
-    fi
-    return 1
-}
+cleanup_nvidia_repos() {
+    log_step "Cleaning up NVIDIA repository files..."
+    
+    # Remove repo files
+    rm -f /etc/apt/sources.list.d/nvidia-docker.list
+    rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    rm -f /etc/apt/sources.list.d/nvidia*.list
+    
+    # Remove keyring files
+    rm -f /etc/apt/keyrings/nvidia-docker.gpg
+    rm -f /etc/apt/keyrings/nvidia-*.gpg
+    rm -f /usr/share/keyrings/nvidia-docker.gpg
+    rm -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 
-check_nvidia_docker() {
-    if dpkg -l | grep -q nvidia-docker2; then
-        log_info "NVIDIA Docker support is already installed."
-        current_version=$(dpkg -l | grep nvidia-docker2 | awk '{print $3}')
-        log_info "Current NVIDIA Docker version: $current_version"
-        return 0
+    # Clean up driver if version mismatch detected
+    if command -v nvidia-smi &>/dev/null && nvidia-smi 2>&1 | grep -q "Driver/library version mismatch"; then
+        log_warn "Detected NVIDIA driver version mismatch. Cleaning up..."
+        run_command "apt-get remove --purge -y '^nvidia-.*'"
+        run_command "apt-get autoremove --purge -y"
+        run_command "update-initramfs -u"
     fi
-    return 1
-}
-
-check_docker_nvidia_runtime() {
-    if docker info 2>/dev/null | grep -q "Runtimes:.*nvidia"; then
-        log_info "NVIDIA runtime is already configured in Docker."
-        return 0
-    fi
-    return 1
 }
 
 ###############################################
@@ -161,7 +95,7 @@ run_preliminary_checks() {
         exit 1
     fi
 
-    # Check for NVIDIA GPU before doing anything else
+    # Check for NVIDIA GPU
     if ! lspci | grep -i nvidia > /dev/null; then
         log_error "No NVIDIA GPU detected! This script requires an NVIDIA GPU."
         exit 1
@@ -176,13 +110,13 @@ run_preliminary_checks() {
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
         if [[ "$NAME" != "Ubuntu" || "$VERSION_ID" != "$UBUNTU_VERSION" ]]; then
-            if [[ $ALLOW_UNSUPPORTED_OS -eq 0 ]] && ! prompt_yes_no "This script is designed for Ubuntu $UBUNTU_VERSION, but detected: $PRETTY_NAME. Continue anyway?"; then
+            if ! prompt_yes_no "This script is designed for Ubuntu $UBUNTU_VERSION, but detected: $PRETTY_NAME. Continue anyway?"; then
                 exit 1
             fi
         fi
     fi
 
-    # Check for required packages - minimal set
+    # Install required packages
     log_info "Installing required dependencies..."
     apt_install "curl gnupg lsb-release ca-certificates wget git"
 
@@ -196,26 +130,12 @@ run_preliminary_checks() {
 }
 
 ###############################################
-# NVIDIA Driver Management
+# NVIDIA Driver Selection and Installation
 ###############################################
-handle_nvidia_driver() {
-    log_step "Setting up NVIDIA drivers..."
-
-    # Check for driver version mismatch
-    if command -v nvidia-smi &>/dev/null && nvidia-smi 2>&1 | grep -q "Driver/library version mismatch"; then
-        log_error "Driver version mismatch detected."
-        if prompt_yes_no "Would you like to reinstall the NVIDIA driver to fix this?"; then
-            # Remove existing drivers
-            run_with_progress "apt-get remove --purge -y '^nvidia-.*'"
-            run_with_progress "apt-get autoremove --purge -y"
-            run_with_progress "update-initramfs -u"
-        else
-            log_error "Driver mismatch must be fixed to continue."
-            exit 1
-        fi
-    fi
-
-    # Check if drivers are already installed and working
+select_nvidia_driver() {
+    log_step "Selecting NVIDIA driver version..."
+    
+    # Check if drivers are already installed
     if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
         log_info "Current NVIDIA installation:"
         nvidia-smi
@@ -224,45 +144,58 @@ handle_nvidia_driver() {
         fi
     fi
 
-    # Install driver dependencies
+    # Install prerequisites
     log_info "Installing driver prerequisites..."
     apt_install "build-essential dkms linux-headers-$(uname -r) ubuntu-drivers-common pkg-config libglvnd-dev"
 
-    # Detect recommended driver
+    # Detect hardware
     log_info "Detecting NVIDIA hardware..."
     ubuntu-drivers devices | grep -i nvidia
     
+    # Get recommended version
+    local recommended_version=$(ubuntu-drivers devices | grep "recommended" | grep -oP 'nvidia-driver-\K[0-9]+' | head -1)
+    
+    if [[ -z "$recommended_version" ]]; then
+        recommended_version="550"  # Default if we can't detect
+    fi
+    
+    log_info "Recommended driver version: $recommended_version"
+
     # Choose installation method
     if prompt_yes_no "Install recommended NVIDIA driver automatically?"; then
-        if ! run_with_progress "ubuntu-drivers autoinstall"; then
-            log_warn "Driver autoinstall failed, attempting manual installation..."
-            if ! apt_install "nvidia-driver-$NVIDIA_DRIVER_VERSION"; then
+        log_info "Installing recommended driver using ubuntu-drivers..."
+        if ! run_command "ubuntu-drivers autoinstall"; then
+            log_warn "Autoinstall failed, attempting manual installation..."
+            if ! apt_install "nvidia-driver-$recommended_version"; then
                 log_error "Failed to install NVIDIA driver"
                 return 1
             fi
         fi
     else
-        # Show available drivers
-        log_info "Available driver versions:"
-        apt-cache search nvidia-driver- | grep "^nvidia-driver-[0-9]" | sort -V
+        # Get driver version from apt cache with no transitional packages
+        log_info "Finding available driver versions..."
+        log_info "Available NVIDIA driver versions:"
+        apt-cache search nvidia-driver- | grep "^nvidia-driver-[0-9]" | grep -v "Transitional package" | sort -V
         
-        # Get user input with default
-        log_prompt "Enter the desired driver version (default: $NVIDIA_DRIVER_VERSION): "
+        # Manual driver selection
+        log_prompt "Enter desired driver version number (default: $recommended_version): "
         read -r driver_version
-        driver_version=${driver_version:-$NVIDIA_DRIVER_VERSION}
+        driver_version=${driver_version:-$recommended_version}
         
-        if [[ -n "$driver_version" ]]; then
-            if ! apt_install "nvidia-driver-$driver_version"; then
-                log_error "Failed to install nvidia-driver-$driver_version"
-                return 1
-            fi
-        else
+        if [[ -z "$driver_version" ]]; then
             log_error "No driver version specified!"
+            return 1
+        fi
+        
+        # Install the selected driver
+        log_info "Installing NVIDIA driver version $driver_version..."
+        if ! apt_install "nvidia-driver-$driver_version"; then
+            log_error "Failed to install nvidia-driver-$driver_version"
             return 1
         fi
     fi
 
-    # Load the module if possible
+    # Load the nvidia module if possible
     modprobe nvidia &>/dev/null || log_warn "Could not load nvidia module (normal before reboot)"
 
     # Check if drivers are working
@@ -271,163 +204,71 @@ handle_nvidia_driver() {
     else
         log_info "NVIDIA drivers successfully installed!"
     fi
+    
+    return 0
 }
 
 ###############################################
-# FFmpeg and Plex Compatibility Checks
+# CUDA Version Selection - Simple Version
 ###############################################
-check_media_compatibility() {
-    log_step "Checking GPU capabilities for media processing..."
-
-    if ! nvidia-smi --query-gpu=gpu_name --format=csv,noheader > /dev/null 2>&1; then
-        log_warn "Cannot check GPU model - driver might not be loaded yet"
-        return
-    fi
-
-    GPU_MODEL=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>/dev/null)
-    log_info "Detected GPU: $GPU_MODEL"
-
-    # Create a more comprehensive compatibility profile
-    if command -v nvidia-smi > /dev/null; then
-        # Check NVENC/NVDEC support
-        NVENC_CHECK=$(nvidia-smi -q | grep -A 4 "Encoder" || echo "")
-        NVDEC_CHECK=$(nvidia-smi -q | grep -A 4 "Decoder" || echo "")
-        
-        # Check GPU architecture
-        CUDA_CAPABILITY=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null)
-        
-        log_info "GPU Architecture: Compute $CUDA_CAPABILITY"
-        
-        if [[ -n "$NVENC_CHECK" ]]; then
-            log_info "✓ NVENC (GPU encoding) is supported"
-            log_info "  → Compatible with FFmpeg GPU acceleration"
-            log_info "  → Compatible with Plex GPU-accelerated encoding"
-            
-            # Show actual encoding capabilities
-            echo "$NVENC_CHECK" | grep -v "Encoder"
-        else
-            log_warn "✗ NVENC not detected - GPU encoding may not be available"
-        fi
-
-        if [[ -n "$NVDEC_CHECK" ]]; then
-            log_info "✓ NVDEC (GPU decoding) is supported"
-            log_info "  → Compatible with FFmpeg GPU acceleration"
-            log_info "  → Compatible with Plex GPU-accelerated decoding"
-            
-            # Show actual decoding capabilities
-            echo "$NVDEC_CHECK" | grep -v "Decoder"
-        else
-            log_warn "✗ NVDEC not detected - GPU decoding may not be available"
-        fi
-    fi
-
-    # Improved GPU compatibility check
-    if [[ -n "$GPU_MODEL" ]]; then
-        case "$GPU_MODEL" in
-            *"RTX 40"*|*"RTX 50"*)
-                log_info "✓ Modern GPU detected - excellent performance expected"
-                log_info "  → Full support for AV1, H.265/HEVC, H.264/AVC"
-                ;;
-            *"RTX 30"*)
-                log_info "✓ Very good GPU model - well-supported"
-                log_info "  → Good support for H.265/HEVC, H.264/AVC"
-                ;;
-            *"RTX 20"*|*"GTX 16"*)
-                log_info "✓ Good GPU model - well-supported"
-                log_info "  → Supports H.265/HEVC, H.264/AVC"
-                ;;
-            *"GTX 10"*)
-                log_info "✓ Supported GPU model - good for most tasks"
-                log_info "  → Good support for H.264/AVC, limited H.265/HEVC"
-                ;;
-            *"GTX 9"*|*"GTX 7"*|*"GTX 8"*)
-                log_warn "! Older GPU model - limited capabilities"
-                log_info "  → Basic H.264/AVC support only"
-                ;;
-            *"Quadro"*)
-                log_info "✓ Quadro GPU detected - should work with Plex"
-                ;;
-            *)
-                log_warn "! Unknown GPU model - check Plex compatibility manually"
-                ;;
-        esac
-    fi
-
-    # Check Docker GPU access
-    if command -v docker &>/dev/null; then
-        log_info "Testing GPU access in Docker..."
-        if docker run --rm --gpus all nvidia/cuda:$CUDA_VERSION-base-ubuntu$UBUNTU_VERSION nvidia-smi &>/dev/null; then
-            log_info "✓ GPU is accessible from Docker containers"
-            
-            # Test FFmpeg compatibility
-            log_info "Testing FFmpeg hardware acceleration..."
-            if ! docker run --rm --gpus all nvidia/cuda:$CUDA_VERSION-base-ubuntu$UBUNTU_VERSION \
-                bash -c "apt-get update > /dev/null 2>&1 && \
-                        apt-get install -y ffmpeg > /dev/null 2>&1 && \
-                        ffmpeg -hide_banner -hwaccels | grep cuda" > /dev/null 2>&1; then
-                log_warn "! FFmpeg CUDA acceleration test failed - might need configuration"
-            else
-                log_info "✓ FFmpeg CUDA acceleration test passed"
+select_cuda_version() {
+    log_step "Selecting CUDA version..."
+    
+    # Display available CUDA versions
+    log_info "Available CUDA versions:"
+    echo "  1. 12.4.0 (default)"
+    echo "  2. 12.3.2"
+    echo "  3. 12.2.2"
+    echo "  4. 12.1.1"
+    echo "  5. 12.0.1"
+    echo "  6. 11.8.0"
+    echo "  7. 11.7.1"
+    echo "  8. 11.6.2"
+    echo "  9. Other (enter manually)"
+    
+    # Get user selection
+    log_prompt "Enter your choice [1-9] or press Enter for default: "
+    read -r choice
+    
+    case "$choice" in
+        1|"") CUDA_VERSION="12.4.0" ;;
+        2) CUDA_VERSION="12.3.2" ;;
+        3) CUDA_VERSION="12.2.2" ;;
+        4) CUDA_VERSION="12.1.1" ;;
+        5) CUDA_VERSION="12.0.1" ;;
+        6) CUDA_VERSION="11.8.0" ;;
+        7) CUDA_VERSION="11.7.1" ;;
+        8) CUDA_VERSION="11.6.2" ;;
+        9) 
+            log_prompt "Enter CUDA version manually: "
+            read -r manual_version
+            if [[ -n "$manual_version" ]]; then
+                CUDA_VERSION=$manual_version
             fi
-        else
-            log_warn "Skipping FFmpeg test - Docker NVIDIA support not ready"
-        fi
-    fi
-
-    # Print Plex configuration recommendations
-    cat <<EOT
-
-╔════════════════════════════════════════════════════════════════╗
-║             Plex Configuration Recommendations                 ║
-╚════════════════════════════════════════════════════════════════╝
-
-▶ Plex Media Server Settings:
-  - Enable 'Use hardware acceleration when available'
-  - Set transcoder quality to 'Prefer higher quality encoding'
-  - Adjust background transcoding x to 1-2 fewer than GPU cores
-
-▶ For Docker:
-  - Environment variables:
-    NVIDIA_VISIBLE_DEVICES=all
-    NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
-
-  - Docker run options:
-    --runtime=nvidia
-    -e NVIDIA_VISIBLE_DEVICES=all
-
-▶ Docker-compose.yml example:
-  plex:
-    image: plexinc/pms-docker:latest
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
-    ...
-EOT
+            ;;
+        *) 
+            log_warn "Invalid choice, using default version 12.4.0"
+            CUDA_VERSION="12.4.0"
+            ;;
+    esac
+    
+    log_info "Selected CUDA version: $CUDA_VERSION"
+    return 0
 }
 
 ###############################################
-# Docker Installation/Update
+# Docker Setup
 ###############################################
-fix_docker_config() {
-    log_info "Checking Docker configuration..."
-    if systemctl status docker 2>&1 | grep -q "Failed to start Docker Application Container Engine"; then
-        log_warn "Detected broken Docker configuration. Fixing..."
-        systemctl stop docker
-        rm -f /etc/docker/daemon.json
-        systemctl start docker
-        return 0
-    fi
-    return 1
-}
-
-handle_docker_installation() {
+setup_docker() {
     log_step "Setting up Docker with NVIDIA support..."
     
     # Check if Docker is already installed
-    if ! check_docker_installation; then
+    if command -v docker >/dev/null 2>&1; then
+        log_info "Docker is already installed."
+        docker_version=$(docker --version)
+        log_info "Current version: $docker_version"
+    else
         log_info "Installing Docker..."
-        # Install Docker repositories using the official install script
         curl -fsSL https://get.docker.com -o get-docker.sh
         chmod +x get-docker.sh
         ./get-docker.sh
@@ -435,27 +276,33 @@ handle_docker_installation() {
         
         # Enable Docker to start on boot
         systemctl enable docker
-    else
-        # Fix Docker configuration if broken
-        fix_docker_config
     fi
     
-    # Install/Update NVIDIA Container Toolkit
-    local nvidia_runtime_needs_install=false
-    if ! check_nvidia_docker || ! check_docker_nvidia_runtime; then
-        nvidia_runtime_needs_install=true
+    # Fix broken Docker configuration if necessary
+    if systemctl status docker 2>&1 | grep -q "Failed to start Docker Application Container Engine"; then
+        log_warn "Detected broken Docker configuration. Fixing..."
+        systemctl stop docker
+        rm -f /etc/docker/daemon.json
+        systemctl start docker
     fi
     
-    if $nvidia_runtime_needs_install || prompt_yes_no "Update NVIDIA Docker support?"; then
+    # Check NVIDIA Docker support
+    local need_nvidia_docker=true
+    if dpkg -l | grep -q nvidia-docker2; then
+        log_info "NVIDIA Docker support is already installed."
+        current_version=$(dpkg -l | grep nvidia-docker2 | awk '{print $3}')
+        log_info "Current NVIDIA Docker version: $current_version"
+        
+        if docker info 2>/dev/null | grep -q "Runtimes:.*nvidia"; then
+            log_info "NVIDIA runtime is already configured in Docker."
+            need_nvidia_docker=false
+        fi
+    fi
+    
+    if [[ "$need_nvidia_docker" == "true" ]] || prompt_yes_no "Update NVIDIA Docker support?"; then
         log_info "Setting up NVIDIA Container Toolkit..."
         
-        # Check if Docker is running before preserving networks
-        local networks=""
-        if systemctl is-active docker &>/dev/null; then
-            networks=$(docker network ls --format '{{.Name}}' 2>/dev/null || echo "")
-        fi
-        
-        # Install nvidia-container-toolkit using their repository
+        # Install nvidia-container-toolkit
         mkdir -p /etc/apt/keyrings
         curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
         curl -s -L https://nvidia.github.io/libnvidia-container/ubuntu$UBUNTU_VERSION/libnvidia-container.list | \
@@ -475,13 +322,15 @@ handle_docker_installation() {
             chmod +x /usr/local/bin/docker-compose
         fi
     fi
+    
+    return 0
 }
 
 ###############################################
-# NVIDIA NVENC & NvFBC Patching
+# NVIDIA Patches
 ###############################################
 apply_nvidia_patches() {
-    log_step "Applying NVIDIA NVENC & NvFBC unlimited sessions patch..."
+    log_step "NVIDIA NVENC & NvFBC unlimited sessions patch..."
     
     if prompt_yes_no "Would you like to patch NVIDIA drivers to remove NVENC session limit?"; then
         # Create temporary directory
@@ -490,14 +339,14 @@ apply_nvidia_patches() {
         
         # Download the patch
         log_info "Downloading NVIDIA patcher..."
-        run_with_progress "git clone https://github.com/keylase/nvidia-patch.git ."
+        run_command "git clone https://github.com/keylase/nvidia-patch.git ."
         
         # Apply NVENC patch
         log_info "Applying NVENC session limit patch..."
         bash ./patch.sh
         
         # Apply NvFBC patch if needed
-        if prompt_yes_no "Would you also like to patch for NvFBC support (useful for OBS and screen capture)?"; then
+        if prompt_yes_no "Would you also like to patch for NvFBC support (useful for OBS)?"; then
             log_info "Applying NvFBC patch..."
             bash ./patch-fbc.sh
         fi
@@ -506,10 +355,10 @@ apply_nvidia_patches() {
         cd - > /dev/null
         rm -rf "$patch_dir"
         
-        log_info "✓ NVIDIA driver successfully patched!"
-        log_info "  → NVENC session limit removed"
-        log_info "  → You can now run unlimited concurrent encoding sessions"
+        log_info "NVIDIA driver successfully patched!"
     fi
+    
+    return 0
 }
 
 ###############################################
@@ -518,8 +367,8 @@ apply_nvidia_patches() {
 configure_docker_for_media() {
     log_step "Configuring Docker for media processing..."
     
-    if prompt_yes_no "Configure Docker with optimized settings for NVIDIA media processing?"; then
-        # Create an optimized daemon.json
+    if prompt_yes_no "Configure Docker with optimized settings for NVIDIA media?"; then
+        # Create a daemon.json config
         mkdir -p /etc/docker
         
         cat > /etc/docker/daemon.json <<EOF
@@ -574,9 +423,98 @@ services:
               capabilities: [gpu, compute, video, utility]
 EOF
         
-        log_info "✓ Docker configured for NVIDIA and media processing"
-        log_info "⚡ Sample docker-compose template created at: /opt/docker-templates/plex-nvidia.yml"
+        log_info "Docker configured for NVIDIA and media processing"
+        log_info "Sample docker-compose created: /opt/docker-templates/plex-nvidia.yml"
     fi
+    
+    return 0
+}
+
+###############################################
+# Check GPU Media Capabilities
+###############################################
+check_gpu_capabilities() {
+    log_step "Checking GPU capabilities for media processing..."
+
+    if ! nvidia-smi --query-gpu=gpu_name --format=csv,noheader > /dev/null 2>&1; then
+        log_warn "Cannot check GPU model - driver might not be loaded yet"
+        return 0
+    fi
+
+    local gpu_model=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>/dev/null)
+    log_info "Detected GPU: $gpu_model"
+
+    # Check for encoder/decoder support
+    if command -v nvidia-smi > /dev/null; then
+        # Check NVENC/NVDEC support
+        local nvenc_check=$(nvidia-smi -q | grep -A 4 "Encoder" || echo "")
+        local nvdec_check=$(nvidia-smi -q | grep -A 4 "Decoder" || echo "")
+        
+        # Get compute capability
+        local cuda_capability=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null)
+        
+        log_info "GPU Architecture: Compute $cuda_capability"
+        
+        if [[ -n "$nvenc_check" ]]; then
+            log_info "✓ NVENC (GPU encoding) is supported"
+            log_info "  → Compatible with FFmpeg GPU acceleration"
+            log_info "  → Compatible with Plex GPU-accelerated encoding"
+        else
+            log_warn "✗ NVENC not detected - GPU encoding may not be available"
+        fi
+
+        if [[ -n "$nvdec_check" ]]; then
+            log_info "✓ NVDEC (GPU decoding) is supported"
+            log_info "  → Compatible with FFmpeg GPU acceleration"
+            log_info "  → Compatible with Plex GPU-accelerated decoding"
+        else
+            log_warn "✗ NVDEC not detected - GPU decoding may not be available"
+        fi
+    fi
+
+    # Give compatibility guidance based on GPU model
+    if [[ -n "$gpu_model" ]]; then
+        case "$gpu_model" in
+            *"RTX 40"*|*"RTX 50"*)
+                log_info "✓ Modern GPU detected - excellent performance expected"
+                log_info "  → Full support for AV1, H.265/HEVC, H.264/AVC"
+                ;;
+            *"RTX 30"*)
+                log_info "✓ Very good GPU model - well-supported"
+                log_info "  → Good support for H.265/HEVC, H.264/AVC"
+                ;;
+            *"RTX 20"*|*"GTX 16"*)
+                log_info "✓ Good GPU model - well-supported"
+                log_info "  → Supports H.265/HEVC, H.264/AVC"
+                ;;
+            *"GTX 10"*)
+                log_info "✓ Supported GPU model - good for most tasks"
+                log_info "  → Good support for H.264/AVC, limited H.265/HEVC"
+                ;;
+            *"GTX 9"*|*"GTX 7"*|*"GTX 8"*)
+                log_warn "! Older GPU model - limited capabilities"
+                log_info "  → Basic H.264/AVC support only"
+                ;;
+            *"Quadro"*)
+                log_info "✓ Quadro GPU detected - should work with Plex"
+                ;;
+            *)
+                log_warn "! Unknown GPU model - check Plex compatibility manually"
+                ;;
+        esac
+    fi
+
+    # Check Docker GPU access
+    if command -v docker &>/dev/null; then
+        log_info "Testing GPU access in Docker..."
+        if docker run --rm --gpus all nvidia/cuda:$CUDA_VERSION-base-ubuntu$UBUNTU_VERSION nvidia-smi &>/dev/null; then
+            log_info "✓ GPU is accessible from Docker containers"
+        else
+            log_warn "GPU is not yet accessible from Docker - reboot may be needed"
+        fi
+    fi
+    
+    return 0
 }
 
 ###############################################
@@ -585,10 +523,10 @@ EOF
 create_test_scripts() {
     log_step "Creating diagnostic and test scripts..."
     
-    # Create a directory for test scripts
+    # Create directory for test scripts
     mkdir -p /usr/local/bin
     
-    # Test script for NVIDIA in Docker
+    # Docker GPU test script
     cat > /usr/local/bin/test-nvidia-docker.sh <<'EOF'
 #!/bin/bash
 echo "Testing NVIDIA GPU access inside Docker..."
@@ -601,7 +539,7 @@ echo -e "\nTesting NVENC encoding capabilities inside Docker..."
 docker run --rm --gpus all nvidia/cuda:latest bash -c "apt-get update >/dev/null && apt-get install -y ffmpeg >/dev/null && ffmpeg -encoders | grep nvenc"
 EOF
 
-    # Test script for direct GPU transcode test
+    # Transcode test script
     cat > /usr/local/bin/test-transcode.sh <<'EOF'
 #!/bin/bash
 if [ ! -f "/tmp/test.mp4" ]; then
@@ -622,9 +560,11 @@ EOF
     chmod +x /usr/local/bin/test-nvidia-docker.sh
     chmod +x /usr/local/bin/test-transcode.sh
     
-    log_info "✓ Test scripts created:"
+    log_info "Test scripts created:"
     log_info "  • /usr/local/bin/test-nvidia-docker.sh - Test GPU access in Docker"
     log_info "  • /usr/local/bin/test-transcode.sh - Test transcoding performance"
+    
+    return 0
 }
 
 ###############################################
@@ -632,33 +572,31 @@ EOF
 ###############################################
 main() {
     log_info "╔══════════════════════════════════════════════════════════════╗"
-    log_info "║  NVIDIA Driver and Media Server Setup (Optimized Edition)    ║"
+    log_info "║  NVIDIA Driver and Media Server Setup                        ║"
     log_info "╚══════════════════════════════════════════════════════════════╝"
     log_info "This script will configure NVIDIA drivers and Docker support,"
     log_info "optimized for Plex and FFmpeg hardware acceleration."
     echo
 
-    # Check if running in an automated environment
-    if [[ -n "$AUTOMATED_INSTALL" ]]; then
-        log_info "Running in automated mode with default options"
-    elif ! prompt_yes_no "Ready to begin?"; then
+    if ! prompt_yes_no "Ready to begin?"; then
         log_info "Setup cancelled."
         exit 0
     fi
 
-    # Timestamp for performance tracking
+    # Start time for tracking
     start_time=$(date +%s)
     
-    # Main installation steps
+    # Run installation steps
     run_preliminary_checks
-    handle_nvidia_driver
+    select_nvidia_driver
+    select_cuda_version
+    setup_docker
     apply_nvidia_patches
-    handle_docker_installation
     configure_docker_for_media
-    check_media_compatibility
+    check_gpu_capabilities
     create_test_scripts
     
-    # Calculate script execution time
+    # Calculate execution time
     end_time=$(date +%s)
     execution_time=$((end_time - start_time))
     minutes=$((execution_time / 60))
@@ -669,6 +607,7 @@ main() {
     log_info "║           Completed in ${minutes}m ${seconds}s                              ║"
     log_info "╚══════════════════════════════════════════════════════════════╝"
     
+    # Check if reboot needed
     if ! nvidia-smi &>/dev/null || ! docker run --rm --gpus all nvidia/cuda:$CUDA_VERSION-base-ubuntu$UBUNTU_VERSION nvidia-smi &>/dev/null; then
         log_warn "A system reboot is required to complete the setup."
         if prompt_yes_no "Would you like to reboot now?"; then
