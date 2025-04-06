@@ -337,15 +337,45 @@ setup_docker() {
 
         # Install nvidia-container-toolkit
         mkdir -p /etc/apt/keyrings
-        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-        curl -s -L https://nvidia.github.io/libnvidia-container/ubuntu$UBUNTU_VERSION/libnvidia-container.list | \
-            sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-            tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+        
+        # Check if the keyring file already exists
+        if [ -f "/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg" ]; then
+            log_info "NVIDIA GPG keyring file already exists."
+            log_info "We need to either overwrite it or use a different filename."
+            
+            if prompt_yes_no "Use existing NVIDIA GPG keyring file?"; then
+                log_info "Using existing keyring file."
+            else
+                # Use a timestamped filename for the new keyring
+                local timestamp=$(date +%Y%m%d%H%M%S)
+                local new_keyring="/usr/share/keyrings/nvidia-container-toolkit-keyring-${timestamp}.gpg"
+                log_info "Downloading NVIDIA GPG key to new file: $new_keyring"
+                
+                # Download to new filename
+                curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o "$new_keyring"
+                
+                # Update the repository configuration to use the new keyring
+                curl -s -L https://nvidia.github.io/libnvidia-container/ubuntu$UBUNTU_VERSION/libnvidia-container.list | \
+                    sed "s#deb https://#deb [signed-by=$new_keyring] https://#g" | \
+                    tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+            fi
+        else
+            # No existing keyring, download it
+            log_info "Downloading NVIDIA GPG key..."
+            curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+            
+            # Add repository using the keyring
+            curl -s -L https://nvidia.github.io/libnvidia-container/ubuntu$UBUNTU_VERSION/libnvidia-container.list | \
+                sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+                tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+        fi
 
+        # Install the packages
         apt_update
         apt_install "nvidia-container-toolkit nvidia-docker2"
 
         # Configure NVIDIA runtime
+        log_info "Configuring NVIDIA runtime for Docker..."
         nvidia-ctk runtime configure --runtime=docker --set-as-default
 
         # Install docker-compose
