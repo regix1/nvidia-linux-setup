@@ -295,95 +295,83 @@ select_cuda_version() {
 setup_docker() {
     log_step "Setting up Docker with NVIDIA support..."
 
-    # Check if Docker is already installed
-    if command -v docker >/dev/null 2>&1; then
-        log_info "Docker is already installed."
-        docker_version=$(docker --version)
-        log_info "Current version: $docker_version"
+    # Remove any existing Docker packages
+    log_info "Removing any existing Docker installations..."
+    run_command "for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do apt-get remove -y \$pkg; done"
+
+    # Install prerequisites
+    log_info "Installing prerequisites..."
+    apt_install "ca-certificates curl"
+    
+    # Set up Docker's official repository following Docker docs
+    log_info "Setting up Docker's official repository..."
+    run_command "install -m 0755 -d /etc/apt/keyrings"
+    run_command "curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc"
+    run_command "chmod a+r /etc/apt/keyrings/docker.asc"
+    
+    # Add the repository using official approach with VERSION_CODENAME
+    run_command "echo \"deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \$(. /etc/os-release && echo \"\${UBUNTU_CODENAME:-\$VERSION_CODENAME}\") stable\" | tee /etc/apt/sources.list.d/docker.list > /dev/null"
+    
+    # Update apt with new repository
+    apt_update
+    
+    # Install Docker packages
+    log_info "Installing Docker packages..."
+    apt_install "docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+    
+    # Restart and ensure Docker is running
+    log_info "Restarting Docker service..."
+    run_command "systemctl restart docker || systemctl start docker"
+    
+    # Check Docker version
+    if systemctl is-active --quiet docker; then
+        log_info "Docker service started successfully!"
+        docker_version=$(docker --version 2>/dev/null || echo "Unable to get Docker version")
+        log_info "Installed Docker version: $docker_version"
     else
-        log_info "Installing Docker..."
-        curl -fsSL https://get.docker.com -o get-docker.sh
-        chmod +x get-docker.sh
-        ./get-docker.sh
-        rm get-docker.sh
-
-        # Enable Docker to start on boot
-        systemctl enable docker
+        log_error "Failed to start Docker. Manually checking status:"
+        run_command "systemctl status docker || service docker status"
+        log_warn "Continuing with installation, but Docker service needs manual fixing"
     fi
 
-    # Fix broken Docker configuration if necessary
-    if systemctl status docker 2>&1 | grep -q "Failed to start Docker Application Container Engine"; then
-        log_warn "Detected broken Docker configuration. Fixing..."
-        systemctl stop docker
-        rm -f /etc/docker/daemon.json
-        systemctl start docker
+    # Setup NVIDIA container toolkit with updated repository
+    log_info "Setting up NVIDIA Container Toolkit..."
+    
+    # Install NVIDIA Container Toolkit
+    run_command "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
+    
+    # Setup distribution-specific variables
+    distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+    
+    # Add the repository
+    run_command "curl -s -L https://nvidia.github.io/nvidia-container-runtime/$distribution/nvidia-container-runtime.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list"
+    
+    # Update package lists
+    apt_update
+    
+    # Install only nvidia-container-toolkit (modern replacement for nvidia-docker2)
+    log_info "Installing NVIDIA Container Toolkit..."
+    apt_install "nvidia-container-toolkit"
+    
+    # Configure Docker to use NVIDIA runtime
+    log_info "Configuring NVIDIA runtime for Docker..."
+    run_command "nvidia-ctk runtime configure --runtime=docker"
+    
+    # Restart Docker for changes to take effect
+    log_info "Restarting Docker service to apply NVIDIA settings..."
+    run_command "systemctl restart docker"
+    
+    # Install docker-compose
+    log_info "Installing Docker Compose..."
+    if [ ! -f /usr/local/bin/docker-compose ]; then
+        curl -SL "https://github.com/docker/compose/releases/download/$DOCKER_COMPOSE_VERSION/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose
+        chmod +x /usr/local/bin/docker-compose
     fi
 
-    # Check NVIDIA Docker support
-    local need_nvidia_docker=true
-    if dpkg -l | grep -q nvidia-docker2; then
-        log_info "NVIDIA Docker support is already installed."
-        current_version=$(dpkg -l | grep nvidia-docker2 | awk '{print $3}')
-        log_info "Current NVIDIA Docker version: $current_version"
-
-        if docker info 2>/dev/null | grep -q "Runtimes:.*nvidia"; then
-            log_info "NVIDIA runtime is already configured in Docker."
-            need_nvidia_docker=false
-        fi
-    fi
-
-    if [[ "$need_nvidia_docker" == "true" ]] || prompt_yes_no "Update NVIDIA Docker support?"; then
-        log_info "Setting up NVIDIA Container Toolkit..."
-
-        # Install nvidia-container-toolkit
-        mkdir -p /etc/apt/keyrings
-        
-        # Check if the keyring file already exists
-        if [ -f "/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg" ]; then
-            log_info "NVIDIA GPG keyring file already exists."
-            log_info "We need to either overwrite it or use a different filename."
-            
-            if prompt_yes_no "Use existing NVIDIA GPG keyring file?"; then
-                log_info "Using existing keyring file."
-            else
-                # Use a timestamped filename for the new keyring
-                local timestamp=$(date +%Y%m%d%H%M%S)
-                local new_keyring="/usr/share/keyrings/nvidia-container-toolkit-keyring-${timestamp}.gpg"
-                log_info "Downloading NVIDIA GPG key to new file: $new_keyring"
-                
-                # Download to new filename
-                curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o "$new_keyring"
-                
-                # Update the repository configuration to use the new keyring
-                curl -s -L https://nvidia.github.io/libnvidia-container/ubuntu$UBUNTU_VERSION/libnvidia-container.list | \
-                    sed "s#deb https://#deb [signed-by=$new_keyring] https://#g" | \
-                    tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-            fi
-        else
-            # No existing keyring, download it
-            log_info "Downloading NVIDIA GPG key..."
-            curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-            
-            # Add repository using the keyring
-            curl -s -L https://nvidia.github.io/libnvidia-container/ubuntu$UBUNTU_VERSION/libnvidia-container.list | \
-                sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-                tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-        fi
-
-        # Install the packages
-        apt_update
-        apt_install "nvidia-container-toolkit nvidia-docker2"
-
-        # Configure NVIDIA runtime
-        log_info "Configuring NVIDIA runtime for Docker..."
-        nvidia-ctk runtime configure --runtime=docker --set-as-default
-
-        # Install docker-compose
-        log_info "Installing Docker Compose..."
-        if [ ! -f /usr/local/bin/docker-compose ]; then
-            curl -SL "https://github.com/docker/compose/releases/download/$DOCKER_COMPOSE_VERSION/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose
-            chmod +x /usr/local/bin/docker-compose
-        fi
+    # Verify installation with hello-world
+    if systemctl is-active --quiet docker; then
+        log_info "Testing Docker installation with hello-world image..."
+        docker run --rm hello-world || log_warn "Hello world test failed. Docker may not be fully functional."
     fi
 
     return 0
