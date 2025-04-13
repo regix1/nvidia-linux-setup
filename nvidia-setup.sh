@@ -102,7 +102,6 @@ run_preliminary_checks() {
     log_info "For optimal NVIDIA GPU performance and reliability in Docker containers,"
     log_info "the following kernel parameters are highly recommended:"
     echo
-    log_info "\033[1;31msystemd.unified_cgroup_hierarchy=0\033[0m  - Prevents 'CUDA_ERROR_NO_DEVICE' errors in containers"
     log_info "\033[1;31mpcie_port_pm=off\033[0m                    - Disables PCIe power management for better performance"
     log_info "\033[1;31mpcie_aspm.policy=performance\033[0m        - Sets PCIe power state policy to performance mode"
     echo
@@ -112,7 +111,7 @@ run_preliminary_checks() {
     log_info "To add these parameters to your GRUB configuration:"
     log_info "1. Edit /etc/default/grub"
     log_info "2. Add these parameters to GRUB_CMDLINE_LINUX_DEFAULT:"
-    log_info "   \033[1;31mExample: GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash systemd.unified_cgroup_hierarchy=0 pcie_port_pm=off pcie_aspm.policy=performance\"\033[0m"
+    log_info "   \033[1;31mExample: GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash pcie_port_pm=off pcie_aspm.policy=performance\"\033[0m"
     log_info "3. Run update-grub (or proxmox-boot-tool refresh on Proxmox)"
     log_info "4. Reboot your system"
     echo
@@ -302,27 +301,27 @@ setup_docker() {
     # Install prerequisites
     log_info "Installing prerequisites..."
     apt_install "ca-certificates curl"
-    
+
     # Set up Docker's official repository following Docker docs
     log_info "Setting up Docker's official repository..."
     run_command "install -m 0755 -d /etc/apt/keyrings"
     run_command "curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc"
     run_command "chmod a+r /etc/apt/keyrings/docker.asc"
-    
+
     # Add the repository using official approach with VERSION_CODENAME
     run_command "echo \"deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \$(. /etc/os-release && echo \"\${UBUNTU_CODENAME:-\$VERSION_CODENAME}\") stable\" | tee /etc/apt/sources.list.d/docker.list > /dev/null"
-    
+
     # Update apt with new repository
     apt_update
-    
+
     # Install Docker packages
     log_info "Installing Docker packages..."
     apt_install "docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
-    
+
     # Restart and ensure Docker is running
     log_info "Restarting Docker service..."
     run_command "systemctl restart docker || systemctl start docker"
-    
+
     # Check Docker version
     if systemctl is-active --quiet docker; then
         log_info "Docker service started successfully!"
@@ -336,31 +335,31 @@ setup_docker() {
 
     # Setup NVIDIA container toolkit with updated repository
     log_info "Setting up NVIDIA Container Toolkit..."
-    
+
     # Install NVIDIA Container Toolkit
     run_command "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
-    
+
     # Setup distribution-specific variables
     distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
-    
+
     # Add the repository
     run_command "curl -s -L https://nvidia.github.io/nvidia-container-runtime/$distribution/nvidia-container-runtime.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list"
-    
+
     # Update package lists
     apt_update
-    
+
     # Install only nvidia-container-toolkit (modern replacement for nvidia-docker2)
     log_info "Installing NVIDIA Container Toolkit..."
     apt_install "nvidia-container-toolkit"
-    
+
     # Configure Docker to use NVIDIA runtime
     log_info "Configuring NVIDIA runtime for Docker..."
     run_command "nvidia-ctk runtime configure --runtime=docker"
-    
+
     # Restart Docker for changes to take effect
     log_info "Restarting Docker service to apply NVIDIA settings..."
     run_command "systemctl restart docker"
-    
+
     # Install docker-compose
     log_info "Installing Docker Compose..."
     if [ ! -f /usr/local/bin/docker-compose ]; then
@@ -418,12 +417,18 @@ apply_nvidia_patches() {
 configure_docker_for_media() {
     log_step "Configuring Docker for media processing..."
 
+    # Ask about using cgroupfs driver to fix Docker GPU issues
+    use_cgroupfs=false
+    if prompt_yes_no "Would you like to configure Docker to use cgroupfs driver? (Fixes common 'CUDA_ERROR_NO_DEVICE' issues)"; then
+        use_cgroupfs=true
+    fi
+
     if prompt_yes_no "Configure Docker with optimized settings for NVIDIA media?"; then
         # Create a daemon.json config
         mkdir -p /etc/docker
 
-        cat > /etc/docker/daemon.json <<EOF
-{
+        # Base configuration
+        local config='{
     "default-runtime": "nvidia",
     "runtimes": {
         "nvidia": {
@@ -439,9 +444,20 @@ configure_docker_for_media() {
     "storage-driver": "overlay2",
     "features": {
         "buildkit": true
-    }
-}
-EOF
+    }'
+
+        # Add cgroupfs option if selected
+        if [[ "$use_cgroupfs" == true ]]; then
+            config="$config,
+    \"exec-opts\": [\"native.cgroupdriver=cgroupfs\"]"
+        fi
+
+        # Close the JSON
+        config="$config
+}"
+
+        # Write the configuration to file
+        echo "$config" > /etc/docker/daemon.json
 
         # Restart Docker to apply changes
         systemctl restart docker
@@ -476,6 +492,10 @@ EOF
 
         log_info "Docker configured for NVIDIA and media processing"
         log_info "Sample docker-compose created: /opt/docker-templates/plex-nvidia.yml"
+
+        if [[ "$use_cgroupfs" == true ]]; then
+            log_info "Docker configured to use cgroupfs driver for improved NVIDIA GPU compatibility"
+        fi
     fi
 
     return 0
